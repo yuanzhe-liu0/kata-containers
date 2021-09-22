@@ -1,0 +1,127 @@
+From 44026a9702afb141fd4dc846f7fc5c07a9efcfec Mon Sep 17 00:00:00 2001
+From: Yuanzhe Liu <yuanzheliu09@gmail.com>
+Date: Thu, 23 Sep 2021 10:08:38 +0800
+Subject: [PATCH 1/2] hw/arm/boot: Expose the pmem nodes in the DT
+
+In case of NV-DIMM slots, let's add /pmem DT nodes.
+original patch see [1].
+
+rebased by Yuanzhe Liu.
+
+Signed-off-by: Eric Auger <eric.auger@redhat.com>
+Signed-off-by: Shameer Kolothum <shameerali.kolothum.thodi@huawei.com>
+Signed-off-by: Yuanzhe Liu <yuanzheliu09@gmail.com>
+
+[1] https://patchwork.kernel.org/patch/11174981/
+---
+ hw/arm/boot.c | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ hw/arm/virt.c | 15 ++++++++++-----
+ 2 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/hw/arm/boot.c b/hw/arm/boot.c
+index 57efb61ee4..62942ffba2 100644
+--- a/hw/arm/boot.c
++++ b/hw/arm/boot.c
+@@ -21,6 +21,7 @@
+ #include "hw/boards.h"
+ #include "sysemu/reset.h"
+ #include "hw/loader.h"
++#include "hw/mem/memory-device.h"
+ #include "elf.h"
+ #include "sysemu/device_tree.h"
+ #include "qemu/config-file.h"
+@@ -524,6 +525,44 @@ static void fdt_add_psci_node(void *fdt)
+     qemu_fdt_setprop_cell(fdt, "/psci", "migrate", migrate_fn);
+ }
+ 
++static int fdt_add_pmem_node(void *fdt, uint32_t acells, uint32_t scells)
++{
++    MemoryDeviceInfoList *info, *info_list = qmp_memory_device_list();
++    MemoryDeviceInfo *mi;
++    int ret;
++
++    for (info = info_list; info != NULL; info = info->next) {
++        mi = info->value;
++
++        if (mi->type == MEMORY_DEVICE_INFO_KIND_NVDIMM) {
++            PCDIMMDeviceInfo *di = mi->u.nvdimm.data;
++            char *nodename;
++
++            nodename = g_strdup_printf("/pmem@%" PRIx64, di->addr);
++            qemu_fdt_add_subnode(fdt, nodename);
++            qemu_fdt_setprop_string(fdt, nodename, "compatible", "pmem-region");
++            ret = qemu_fdt_setprop_sized_cells(fdt, nodename, "reg", acells,
++                                               di->addr, scells, di->size);
++            /* only set the NUMA ID if it is specified */
++            if (!ret && di->node >= 0) {
++                ret = qemu_fdt_setprop_cell(fdt, nodename, "numa-node-id",
++                                            di->node);
++            }
++
++            g_free(nodename);
++
++            if (ret < 0) {
++                fprintf(stderr, "couldn't add NVDIMM /memory@%"PRIx64" node\n",
++                        di->addr);
++                goto out;
++            }
++        }
++    }
++out:
++    qapi_free_MemoryDeviceInfoList(info_list);
++    return ret;
++}
++
+ int arm_load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
+                  hwaddr addr_limit, AddressSpace *as, MachineState *ms)
+ {
+@@ -623,6 +662,12 @@ int arm_load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
+         }
+     }
+ 
++    rc = fdt_add_pmem_node(fdt, acells, scells);
++    if (rc < 0) {
++        fprintf(stderr, "couldn't add pmem memory nodes\n");
++        goto fail;
++    }
++
+     rc = fdt_path_offset(fdt, "/chosen");
+     if (rc < 0) {
+         qemu_fdt_add_subnode(fdt, "/chosen");
+diff --git a/hw/arm/virt.c b/hw/arm/virt.c
+index 81eda46b0b..88068a8238 100644
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -2385,9 +2385,12 @@ static void virt_memory_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+     const bool is_nvdimm = object_dynamic_cast(OBJECT(dev), TYPE_NVDIMM);
+ 
+     if (!vms->acpi_dev) {
+-        error_setg(errp,
+-                   "memory hotplug is not enabled: missing acpi-ged device");
+-        return;
++          /* Allow nvdimm DT or cold plug */
++          if (!(is_nvdimm && !dev->hotplugged)) {
++              error_setg(errp,
++                         "memory hotplug is not enabled: missing acpi-ged device");
++              return;
++         }
+     }
+ 
+     if (vms->mte) {
+@@ -2415,9 +2418,11 @@ static void virt_memory_plug(HotplugHandler *hotplug_dev,
+     if (is_nvdimm) {
+         nvdimm_plug(ms->nvdimms_state);
+     }
++    if (vms->acpi_dev) {
++        hotplug_handler_plug(HOTPLUG_HANDLER(vms->acpi_dev),
++                          dev, &error_abort);
++    }
+ 
+-    hotplug_handler_plug(HOTPLUG_HANDLER(vms->acpi_dev),
+-                         dev, &error_abort);
+ }
+ 
+ static void virt_machine_device_pre_plug_cb(HotplugHandler *hotplug_dev,
+-- 
+2.17.1
+
